@@ -20,7 +20,7 @@
     (((v)->is_key && !(v)->is_null)*sizeof(void*)) \
 )
 
-/* Return the pointer to the last child pointer in a vertex.
+/* Return the pointer to the last child pointer in a vertex
  * For a compressed vertex this is the only child pointer  */
 #define radix_vertex_last_child_ptr(v) ((radix_vertex **) ( \
 			((uint8_t *)(v)) + \
@@ -28,6 +28,45 @@
 			sizeof(radix_vertex *) - \
 			(((v)->is_key && (v)->is_null) ? sizeof(void *) : 0) \
 ))
+
+/* Return the pointer to the first child pointer in a vertex */
+#define radix_vertex_first_child_ptr(v) ((radix_vertex **) ( \
+    (v)->data + \
+    (v)->size + \
+    radix_padding((v)->size)))
+
+static inline bool
+_stack_push(radix_stack *stack, void *ptr)
+{
+	if (stack->size == stack->capacity)
+	{
+		if (stack->stack == stack->static_items)
+		{
+			stack->stack = malloc(sizeof(void *) * stack->capacity * 2);
+			if (stack->stack == NULL)
+			{
+				stack->oom = true;
+				stack->stack = stack->static_items;
+				return false;
+			}
+			memcpy(stack->stack, stack->static_items, sizeof(void *) * stack->capacity);
+		}
+		else
+		{
+			void **new_allocation = realloc(stack->stack, sizeof(void *) * stack->capacity * 2);
+			if (new_allocation == NULL)
+			{
+				stack->oom = true;
+				return false;
+			}
+			stack->stack = new_allocation;
+		}
+		stack->capacity *= 2;
+	}
+
+	stack->stack[stack->size++] = ptr;
+	return true;
+}
 
 static radix_vertex *
 new_vertex(size_t children, bool datafield)
@@ -70,10 +109,28 @@ radix_get_data(radix_vertex *v)
 {
 	if (v->is_null) return NULL;
 
-	void **vdata = (void **)((uint8_t*)v + radix_vertex_current_size(v) - sizeof(void *));
+	void **vdata = (void **)((uint8_t *)v + radix_vertex_current_size(v) - sizeof(void *));
 	void *data;
 	memcpy(&data, vdata, sizeof(void *)); /* ? v->size ? */
 	return data;
+}
+
+static void
+radix_set_data(radix_vertex *v, void *data)
+{
+	v->is_key = 1;
+	if (data != NULL)
+	{
+		v->is_null = 0;
+		void **vdata = (void **)((uint8_t *)v + radix_vertex_current_size(v) - sizeof(void *));
+		memcpy(&data, vdata, sizeof(void *));
+	}
+	else
+	{
+		v->is_null = 1;
+	}
+
+
 }
 
 static void
@@ -97,6 +154,16 @@ _radix_free(radix_tree *t, radix_vertex *v, void (*free_callback)(void *))
 	--t->num_vertices;
 }
 
+static radix_vertex *
+_radix_realloc_data(radix_vertex *v, void *data)
+{
+	if (data == NULL) // realloc unnecessary
+		return v;
+
+	size_t curr_size = radix_vertex_current_size(v);
+	return realloc(v, curr_size + sizeof(void *));
+}
+
 void 
 radix_free_callback(radix_tree *t, void (*free_callback)(void *))
 {
@@ -109,5 +176,453 @@ void
 radix_free(radix_tree *t)
 {
 	radix_free_callback(t, NULL);
+}
+
+static inline size_t 
+_radix_walk(radix_tree *t, uint8_t *s, size_t len, radix_vertex **_stop_vertex, radix_vertex ***_parent_link, int *_split_pos, radix_stack *stack)
+{
+	radix_vertex *h = t->head;
+	radix_vertex **parent_link = &t->head;
+
+	size_t i = 0; /* pos in the string */
+	size_t j = 0; /* position in the vertex children */
+
+	while (h->size && i < len)
+	{
+		uint8_t *data = h->data;
+
+		if (h->is_compressed)
+		{
+			for (j = 0; j < h->size && i < len; ++j, ++i)
+			{
+				if (data[j] != s[i]) 
+					break;
+			}
+			if (j != h->size) 
+				break;
+		} 
+		else
+		{
+			/* curiously, linear search in contiguous memory is comparable to binary search */
+			for (j = 0; j < h->size; ++j)
+			{
+				if (data[j] == s[i])
+					break;
+			}
+			if (j == h->size)
+				break;
+			++i;
+		}
+
+		if (stack)
+		{
+			_stack_push(stack, h);
+		}
+
+		radix_vertex **children = radix_vertex_first_child_ptr(h);
+		if (h->is_compressed)
+			j = 0;
+
+		memcpy(&h, children + j, sizeof(h));
+		parent_link = children + j;
+		j = 0;
+	}
+
+	if (_stop_vertex)
+		*_stop_vertex = h;
+
+	if (_parent_link)
+		*_parent_link = parent_link;
+
+	if (_split_pos && h->is_compressed)
+		*_split_pos = j;
+
+	return i;
+}
+
+static radix_vertex *
+_compress(radix_vertex *v, uint8_t *s, size_t len, radix_vertex **child)
+{
+	assert(v->size == 0 && !v->is_compressed);	
+
+	void *data = NULL;
+	size_t new_size;
+
+	*child = new_vertex(0, 0);
+	if (*child == NULL) return NULL;
+
+	new_size = sizeof(radix_vertex) + len + radix_padding(len) + sizeof(radix_vertex *);
+	
+	if (v->is_key)
+	{
+		data = radix_get_data(v);
+		if (!v->is_null)
+			new_size += sizeof(void *);
+	}
+
+	radix_vertex *newv = realloc(v, new_size);
+	if (newv == NULL)
+	{
+		free(*child);
+		return NULL;
+	}
+
+	v = newv;
+	v->is_compressed = true;
+	v->size = len;
+	memcpy(v->data, s, len);
+	if (v->is_key)
+		radix_set_data(v, data);
+
+	radix_vertex **childfield = radix_vertex_last_child_ptr(v);
+	memcpy(childfield, child, sizeof(*child));
+
+	return v;
+}
+
+static radix_vertex *
+_add_child(radix_vertex *v, uint8_t c, radix_vertex **childptr, radix_vertex ***parent_link)
+{
+	assert(!v->is_compressed);
+
+	size_t curr_size = radix_vertex_current_size(v);
+	++v->size;
+	size_t new_size = radix_vertex_current_size(v);
+	--v->size; // restore; update on success at the end
+
+	radix_vertex *child = new_vertex(0, 0); // allocate it
+	if (child == NULL) return NULL;
+
+	radix_vertex *newv = realloc(v, new_size);
+	if (newv == NULL)
+	{
+		free(child);
+		return NULL;
+	}
+
+	v = newv;
+	
+	int pos;
+	for (pos = 0; pos < v->size; ++pos)
+	{
+		if (v->data[pos] > c) break;
+	}
+
+	uint8_t *dst, *src;
+	if (!v->is_null && v->is_key)
+	{
+		dst = (uint8_t *)v + new_size - sizeof(void *);
+		src = (uint8_t *)v + curr_size - sizeof(void *);
+		memmove(dst, src, sizeof(void *));
+	}
+
+	size_t shift = new_size - curr_size - sizeof(void *);
+
+	src = v->data + v->size + radix_padding(v->size) + sizeof(radix_vertex *) * pos;
+	memmove(src + shift + sizeof(radix_vertex *), src, sizeof(radix_vertex *) * (v->size - pos));
+
+	if (shift)
+	{
+		src = (uint8_t *)radix_vertex_first_child_ptr(v);
+		memmove(src + shift, src, sizeof(radix_vertex *) * pos);
+	}
+
+	src = v->data + pos;
+	memmove(src + 1, src, v->size - pos);
+
+	v->data[pos] = c;
+	++v->size;
+
+	src = (uint8_t *)radix_vertex_first_child_ptr(v);
+	radix_vertex **childfield = (radix_vertex **)(src + sizeof(radix_vertex *) * pos);
+	memcpy(childfield, &child, sizeof(child));
+
+	*childptr = child;
+	*parent_link = childfield;
+
+	return v;
+}
+
+/* returns 0 on no insert, returns 1 on insert */
+static int
+_radix_insert(radix_tree *t, uint8_t *s, size_t len, void *data, void **old, bool overwrite)
+{
+	size_t i;
+	int j = 0; /* split position */
+	radix_vertex *h, **parent_link;
+
+	i = _radix_walk(t, s, len, &h, &parent_link, &j, NULL);
+
+	if (i == len && (!h->is_compressed || j == 0)) // key vertex exists and it's not compressed
+	{
+		if (!h->is_key || (h->is_null && overwrite))
+		{
+			h = _radix_realloc_data(h, data);
+			if (h)
+				memcpy(parent_link, &h, sizeof(h));
+		}
+		if (h == NULL)
+			return 0;
+
+		// update key
+		if (h->is_key)
+		{
+			if (old)
+				*old = radix_get_data(h);
+
+			if (overwrite)
+				radix_set_data(h, data);
+
+			return 0;
+		}
+
+		radix_set_data(h, data);
+		++t->num_elements;
+		return 1;
+	}
+
+	/* 
+	 * uncompress the compressed vertex (if this is the case) 
+	 * */
+
+	if (i != len && h->is_compressed)
+	{
+		/* Save next pointer */
+		radix_vertex **childfield = radix_vertex_last_child_ptr(h);
+		radix_vertex *next;
+		memcpy(&next, childfield, sizeof(next));
+		
+		size_t prefix_len = j;
+		size_t postfix_len = h->size - j - 1;
+		bool split_vertex_is_key = !prefix_len && !h->is_null && h->is_key;
+		size_t vertex_size;
+
+		/* Create un-compressed vertex */
+		radix_vertex *split_vertex = new_vertex(1, split_vertex_is_key); // 1 child
+		radix_vertex *prefix = NULL;
+		radix_vertex *postfix = NULL;
+
+		if (prefix_len)
+		{
+			vertex_size = sizeof(radix_vertex) + prefix_len + radix_padding(prefix_len) + sizeof(radix_vertex *);
+			if (!h->is_null && h->is_key)
+				vertex_size += sizeof(void *);
+			prefix = malloc(vertex_size);
+		}
+
+		if (postfix_len)
+		{
+			vertex_size = sizeof(radix_vertex) + postfix_len + radix_padding(postfix_len) + sizeof(radix_vertex *);
+			postfix = malloc(vertex_size);
+		}
+
+		// abort on OOM
+		if (split_vertex == NULL || (prefix_len && prefix == NULL) || (postfix_len && postfix == NULL))
+		{
+			free(split_vertex);
+			free(prefix);
+			free(postfix);
+			return 0;
+		}
+
+		split_vertex->data[0] = h->data[i];
+
+		/* Create prefix vertex */
+		if (j == 0)
+		{
+			/* Replace old vertex with split vertex */
+			if (h->is_key)
+			{
+				void *vdata = radix_get_data(h);
+				radix_set_data(split_vertex, vdata);
+			}
+			memcpy(parent_link, &split_vertex, sizeof(split_vertex));
+		}
+		else
+		{
+			/* Trim the compressed vertex into prefix */
+			prefix->size = prefix_len;
+			memcpy(prefix->data, h->data, prefix_len);
+			prefix->is_compressed = prefix_len > 1;
+			prefix->is_key = h->is_key;
+			prefix->is_null = h->is_null;
+			if (!h->is_null && h->is_key)
+			{
+				void *vdata = radix_get_data(h);
+				radix_set_data(prefix, vdata);
+			}
+
+			radix_vertex **cp = radix_vertex_last_child_ptr(prefix);
+			memcpy(cp, &split_vertex, sizeof(split_vertex));
+			memcpy(parent_link, &prefix, sizeof(prefix)); // set parent link to split_vertex parent
+			++t->num_vertices;
+		}
+
+		/* Create postfix vertex */
+		if (postfix_len)
+		{
+			postfix->size = postfix_len;
+			memcpy(postfix->data, h->data + prefix_len + 1, postfix_len);
+			postfix->is_compressed = postfix_len > 1;
+			postfix->is_key = false;
+			postfix->is_null = false;
+
+			radix_vertex **cp = radix_vertex_last_child_ptr(postfix);
+			memcpy(cp, &next, sizeof(next));
+			++t->num_vertices;
+		}
+		else
+		{
+			postfix = next;
+		}
+
+		/* Set split_vertex's last child as the postfix node */
+		radix_vertex **split_child = radix_vertex_last_child_ptr(split_vertex);
+		memcpy(split_child, &postfix, sizeof(postfix));
+		
+		/* Continue to fall-through (insertion) */
+		free(h);
+		h = split_vertex;
+	}
+	else if (i == len && h->is_compressed)
+	{
+		/* Save next pointer */
+		radix_vertex **childfield = radix_vertex_last_child_ptr(h);
+		radix_vertex *next;
+		memcpy(&next, childfield, sizeof(next));
+
+		size_t postfix_len = h->size - j;
+		size_t vertex_size = sizeof(radix_vertex) + postfix_len + radix_padding(postfix_len) + sizeof(radix_vertex *);
+		if (data != NULL)
+			vertex_size += sizeof(void *);
+
+		radix_vertex *postfix = malloc(vertex_size);
+
+		vertex_size = sizeof(radix_vertex) + j + radix_padding(j) + sizeof(radix_vertex *);
+		if (!h->is_null && h->is_key)
+			vertex_size += sizeof(void *);
+
+		radix_vertex *prefix = malloc(vertex_size);
+
+		if (prefix == NULL || postfix == NULL)
+		{
+			free(prefix);
+			free(postfix);
+			return 0;
+		}
+
+		/* Create postfix vertex */
+		postfix->size = postfix_len;
+		memcpy(postfix->data, h->data + j, postfix_len);
+		postfix->is_compressed = postfix_len > 1;
+		postfix->is_key = false;
+		postfix->is_null = false;
+		radix_set_data(postfix, data);
+
+		radix_vertex **cp = radix_vertex_last_child_ptr(postfix);
+		memcpy(cp, &next, sizeof(next));
+		++t->num_vertices;
+
+		/* Trim compressed vertex */
+		prefix->size = j;
+		memcpy(prefix->data, h->data, j);
+		prefix->is_compressed = j > 1;
+		prefix->is_key = false;
+		prefix->is_null = false;
+
+		memcpy(parent_link, &prefix, sizeof(prefix));
+		if (h->is_key)
+		{
+			void *vdata = radix_get_data(h);
+			radix_set_data(prefix, vdata);
+		}
+
+		cp = radix_vertex_last_child_ptr(prefix);
+		memcpy(cp, &postfix, sizeof(postfix));
+
+		/* key is already inserted */
+
+		++t->num_elements;
+		free(h);
+		return 1;
+	}
+
+	/* fall through, still got some chars left to go in string */
+	while (i < len)
+	{
+		radix_vertex *child;	
+
+		/* successive vertices with 1 children are compressed */
+		if (h->size == 0 && len - i > 1)
+		{
+			size_t compressed_size = len - i;
+			if (compressed_size > RADIX_VERTEX_MAX_SIZE) 
+				compressed_size = RADIX_VERTEX_MAX_SIZE;
+
+			radix_vertex *newh = _compress(h, s+i, compressed_size, &child);
+			if (newh == NULL)
+				goto OOM;
+
+			h = newh;
+			memcpy(parent_link, &h, sizeof(h));
+			parent_link = radix_vertex_last_child_ptr(h);
+			i += compressed_size;
+		}
+		else // normal insert
+		{
+			radix_vertex **new_parent_link;	
+			radix_vertex *newh = _add_child(h, s[i], &child, &new_parent_link);
+			if (newh == NULL)
+				goto OOM;
+
+			h = newh;
+			memcpy(parent_link, &h, sizeof(h));
+			parent_link = new_parent_link;
+			++i;
+		}
+
+		++t->num_vertices;
+		h = child;
+	}
+
+	radix_vertex *newh = _radix_realloc_data(h, data);
+	if (newh == NULL)
+		goto OOM;
+	
+	h = newh;
+	if (!h->is_key)
+		++t->num_elements;
+
+	radix_set_data(h, data);
+	memcpy(parent_link, &h, sizeof(h));
+	return 1;
+
+OOM: // out of memory
+	if (h->size == 0)
+	{
+		h->is_null = true;
+		h->is_key = true;
+		++t->num_elements; /* compensation for next removal */
+		assert(radix_del(t, s, i, NULL) != 0);
+	}
+
+	return 0;
+}
+
+/* overwriting insert that updates the element if it exists */
+int 
+radix_insert(radix_tree *t, uint8_t *s, size_t len, void *data, void **old)
+{
+	return _radix_insert(t, s, len, data, old, 1);
+}
+
+int 
+radix_del(radix_tree *t, uint8_t *s, size_t len, void **old)
+{
+	(void)t;
+	(void)s;
+	(void)len;
+	(void)old;
+	return 1;	
 }
 
