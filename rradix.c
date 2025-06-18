@@ -69,7 +69,7 @@ _stack_push(radix_stack *stack, void *ptr)
 }
 
 static radix_vertex *
-new_vertex(size_t children, bool datafield)
+_new_vertex(size_t children, bool datafield)
 {
 	size_t size = sizeof(radix_vertex) + children + radix_padding(children) + sizeof(radix_vertex*) * children;
 	if (datafield)
@@ -93,7 +93,7 @@ radix_new(void)
 
 	t->num_elements = 0;
 	t->num_vertices = 1;
-	t->head = new_vertex(0, false);
+	t->head = _new_vertex(0, false);
 	
 	if (t->head == NULL)
 	{
@@ -248,7 +248,7 @@ _compress(radix_vertex *v, uint8_t *s, size_t len, radix_vertex **child)
 	void *data = NULL;
 	size_t new_size;
 
-	*child = new_vertex(0, 0);
+	*child = _new_vertex(0, 0);
 	if (*child == NULL) return NULL;
 
 	new_size = sizeof(radix_vertex) + len + radix_padding(len) + sizeof(radix_vertex *);
@@ -290,7 +290,7 @@ _add_child(radix_vertex *v, uint8_t c, radix_vertex **childptr, radix_vertex ***
 	size_t new_size = radix_vertex_current_size(v);
 	--v->size; // restore; update on success at the end
 
-	radix_vertex *child = new_vertex(0, 0); // allocate it
+	radix_vertex *child = _new_vertex(0, 0); // allocate it
 	if (child == NULL) return NULL;
 
 	radix_vertex *newv = realloc(v, new_size);
@@ -398,7 +398,7 @@ _radix_insert(radix_tree *t, uint8_t *s, size_t len, void *data, void **old, boo
 		size_t vertex_size;
 
 		/* Create un-compressed vertex */
-		radix_vertex *split_vertex = new_vertex(1, split_vertex_is_key); // 1 child
+		radix_vertex *split_vertex = _new_vertex(1, split_vertex_is_key); // 1 child
 		radix_vertex *prefix = NULL;
 		radix_vertex *postfix = NULL;
 
