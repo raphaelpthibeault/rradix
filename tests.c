@@ -46,12 +46,92 @@ radix_insert_should_insert(void **state)
 	radix_free(t);
 }
 
+static void
+radix_insert_should_compress(void **state)
+{
+	(void)state;
+
+	radix_tree *t = radix_new();
+	radix_insert(t, (uint8_t *)"foo", 3, (void *)(long)1, NULL);
+	radix_insert(t, (uint8_t *)"foobar", 6, (void *)(long)2, NULL);
+	radix_insert(t, (uint8_t *)"footer", 6, (void *)(long)3, NULL);
+	radix_insert(t, (uint8_t *)"first", 5, (void *)(long)4, NULL);
+
+	assert_int_equal(t->num_elements, 4);
+	assert_int_equal(t->num_vertices, 10);
+
+#ifdef DEBUG
+	radix_print(t);
+#endif
+
+	radix_free(t);
+}
+
+static void
+radix_del_vertex_with_no_children_should_cleanup(void **state)
+{
+	(void)state;
+
+	radix_tree *t = radix_new();
+	radix_insert(t, (uint8_t *)"foo", 3, (void *)(long)1, NULL);
+	radix_insert(t, (uint8_t *)"foobar", 6, (void *)(long)2, NULL);
+
+#ifdef DEBUG
+	radix_print(t);
+#endif
+
+	assert_int_equal(t->num_elements, 2);
+	assert_int_equal(t->num_vertices, 3);
+
+	radix_del(t, (uint8_t *)"foobar", 6, NULL);
+
+	assert_int_equal(t->num_elements, 1);
+	assert_int_equal(t->num_vertices, 2);
+
+#ifdef DEBUG
+	radix_print(t);
+#endif
+
+	radix_free(t);
+}
+
+static void
+radix_del_vertex_with_children_should_compress(void **state)
+{
+	(void)state;	
+
+	radix_tree *t = radix_new();
+	radix_insert(t, (uint8_t *)"foobar", 6, (void *)(long)2, NULL);
+	radix_insert(t, (uint8_t *)"footer", 6, (void *)(long)3, NULL);
+
+#ifdef DEBUG
+	radix_print(t);
+#endif
+
+	assert_int_equal(t->num_elements, 2);
+	assert_int_equal(t->num_vertices, 6);
+
+	radix_del(t, (uint8_t *)"footer", 6, NULL);
+
+	assert_int_equal(t->num_elements, 1);
+	assert_int_equal(t->num_vertices, 2);
+
+#ifdef DEBUG
+	radix_print(t);
+#endif
+
+	radix_free(t);
+}
+
 int
 main(void)
 {
 	const struct CMUnitTest tests[] = {
 		cmocka_unit_test(radix_new_should_init),
 		cmocka_unit_test(radix_insert_should_insert),
+		cmocka_unit_test(radix_insert_should_compress),
+		cmocka_unit_test(radix_del_vertex_with_no_children_should_cleanup),
+		cmocka_unit_test(radix_del_vertex_with_children_should_compress),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

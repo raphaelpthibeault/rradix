@@ -7,15 +7,6 @@
 #include <assert.h>
 #include <stdio.h>
 
-bool debug = true;
-
-#define debugf(...)                                         \
-	if (debug) {																							\
-	printf("%s:%s:%d:\t", __FILE__, __func__, __LINE__);			\
-	printf(__VA_ARGS__);																			\
-	fflush(stdout);                                           \
-	}																													\
-
 /* Return the padding needed by vertex
  * The padding is needed to store the child pointers to aligned addresses
  * Add 4 to the vertex_size because a vertex has a 4-byte header */
@@ -33,10 +24,10 @@ bool debug = true;
 /* Return the pointer to the last child pointer in a vertex
  * For a compressed vertex this is the only child pointer  */
 #define radix_vertex_last_child_ptr(v) ((radix_vertex **) ( \
-			((uint8_t *)(v)) + \
-			radix_vertex_current_size(v) - \
-			sizeof(radix_vertex *) - \
-			(((v)->is_key && (v)->is_null) ? sizeof(void *) : 0) \
+    ((uint8_t *)(v)) + \
+    radix_vertex_current_size(v) - \
+    sizeof(radix_vertex *) - \
+    (((v)->is_key && !(v)->is_null) ? sizeof(void*) : 0) \
 ))
 
 /* Return the pointer to the first child pointer in a vertex */
@@ -44,6 +35,40 @@ bool debug = true;
     (v)->data + \
     (v)->size + \
     radix_padding((v)->size)))
+
+#ifdef DEBUG
+bool debug = true;
+#else
+bool debug = false;
+#endif
+
+#define debugf(...)                                         \
+	if (debug) {																							\
+	printf("%s:%s:%d:\t", __FILE__, __func__, __LINE__);			\
+	printf(__VA_ARGS__);																			\
+	fflush(stdout);                                           \
+	}																													\
+
+/* Used by debug_vertex() macro */
+void 
+debug_show_vertex(const char *msg, radix_vertex *v) 
+{
+    if (!debug) return;
+    printf("%s: %p [%.*s] key:%d size:%d children:",
+        msg, (void*)v, (int)v->size, (char*)v->data, v->is_key, v->size);
+    int num_children = v->is_compressed ? 1 : v->size;
+    radix_vertex **cp = radix_vertex_last_child_ptr(v) - (num_children - 1);
+    while (num_children--) {
+        radix_vertex *child;
+        memcpy(&child, cp, sizeof(child));
+        ++cp;
+        printf("%p ", (void*)child);
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
+#define debug_vertex(msg,v) debug_show_vertex(msg,v)
 
 static inline void
 _stack_init(radix_stack *stack)
@@ -120,8 +145,8 @@ _new_vertex(size_t children, bool datafield)
 	radix_vertex *v = malloc(size);
 	if (v == NULL) return NULL;
 
-	v->is_key = 0;
-	v->is_key = 0;
+	v->is_key = false;
+	v->is_null = false;
 	v->is_compressed = 0;
 	v->size = children;
 	return v;
@@ -173,27 +198,6 @@ radix_set_data(radix_vertex *v, void *data)
 	}
 }
 
-static void
-_radix_free(radix_tree *t, radix_vertex *v, void (*free_callback)(void *))
-{
-	int num_children = v->is_compressed ? 1 : v->size;	
-	radix_vertex **cp = radix_vertex_last_child_ptr(v);
-
-	while (num_children--)
-	{
-		radix_vertex *c;
-		memcpy(&c, cp, sizeof(*c));
-		_radix_free(t, c, free_callback);
-		--cp;
-	}
-
-	if (free_callback != NULL && !v->is_null && v->is_key)
-		free_callback(radix_get_data(v));
-
-	free(v);
-	--t->num_vertices;
-}
-
 static radix_vertex *
 _radix_realloc_data(radix_vertex *v, void *data)
 {
@@ -202,6 +206,30 @@ _radix_realloc_data(radix_vertex *v, void *data)
 
 	size_t curr_size = radix_vertex_current_size(v);
 	return realloc(v, curr_size + sizeof(void *));
+}
+
+static void
+_radix_free(radix_tree *t, radix_vertex *v, void (*free_callback)(void *))
+{
+	debug_vertex("free traversing", v);
+	int num_children = v->is_compressed ? 1 : v->size;	
+	radix_vertex **cp = radix_vertex_last_child_ptr(v);
+
+	while (num_children--)
+	{
+		radix_vertex *c;
+		memcpy(&c, cp, sizeof(c));
+		_radix_free(t, c, free_callback);
+		--cp;
+	}
+
+	debug_vertex("free depth-first", v);
+	
+	if (free_callback && !v->is_null && v->is_key)
+		free_callback(radix_get_data(v));
+
+	free(v);
+	--t->num_vertices;
 }
 
 void 
@@ -432,7 +460,7 @@ _radix_insert(radix_tree *t, uint8_t *s, size_t len, void *data, void **old, boo
 
 	if (i != len && h->is_compressed)
 	{
-		debugf("Algoritm 1: Stopped at compressed node '%.*s' (%p)\n",
+		debugf("Algorithm 1: Stopped at compressed node '%.*s' (%p)\n",
 				h->size, h->data, (void*)h);
 		debugf("Still to insert: '%.*s'\n", (int)(len-i), s+i);
 		debugf("Splitting at %d: '%c'\n", j, ((char*)h->data)[j]);
@@ -696,8 +724,10 @@ _radix_find_parent_link(radix_vertex *parent, radix_vertex *child)
 }
 
 static radix_vertex *
-_radix_remove_child(radix_vertex *parent, radix_vertex *child)
+_radix_del_child(radix_vertex *parent, radix_vertex *child)
 {
+	debug_vertex("_radix_del_child before", parent);
+
 	if (parent->is_compressed)
 	{
 		void *data = NULL;
@@ -711,6 +741,7 @@ _radix_remove_child(radix_vertex *parent, radix_vertex *child)
 		if (parent->is_key)
 			radix_set_data(parent, data);
 
+		debug_vertex("_radix_del_child after", parent);
 		return parent;
 	}
 
@@ -730,19 +761,22 @@ _radix_remove_child(radix_vertex *parent, radix_vertex *child)
 	}
 
 	int tail_len = parent->size - (edge - parent->data) - 1;
+	debugf("_radix_del_child tail len: %d\n", tail_len);
 	memmove(edge, edge + 1, tail_len);
 
 	size_t shift = ((parent->size + 4) % sizeof(void *)) == 1 ? sizeof(void *) : 0;
 	if (shift)
-		memmove(((char *)cp) - shift, cp, (parent->size - tail_len - 1) * sizeof(radix_vertex **));
+		memmove(((uint8_t *)cp) - shift, cp, (parent->size - tail_len - 1) * sizeof(radix_vertex **));
 
 	size_t value_len = (!parent->is_null && parent->is_key) ? sizeof(void *) : 0;
-	memmove(((char *)c) - shift, c + 1, tail_len * sizeof(radix_vertex **) + value_len);
+	memmove(((uint8_t *)c) - shift, c + 1, tail_len * sizeof(radix_vertex **) + value_len);
 
 	--parent->size;
 
 	/* frees data if overallocated; if it fails the old address is returned - which is valid */
 	radix_vertex *newv = realloc(parent, radix_vertex_current_size(parent));
+	if (newv)
+		debug_vertex("_radix_del_child after", newv);
 
 	return newv ? newv : parent;
 }
@@ -753,10 +787,12 @@ radix_del(radix_tree *t, uint8_t *s, size_t len, void **old)
 	radix_vertex *h;
 	radix_stack stack;
 
+	debugf("### Delete: %.*s\n", (int)len, s);
+
 	_stack_init(&stack);
 	int split_pos = 0;
 
-	size_t i = _radix_walk(t, s, len, &h, NULL, &split_pos, NULL);
+	size_t i = _radix_walk(t, s, len, &h, NULL, &split_pos, &stack);
 	if (i != len || (h->is_compressed && split_pos != 0) || !h->is_key)
 	{
 		_stack_free(&stack);
@@ -773,9 +809,13 @@ radix_del(radix_tree *t, uint8_t *s, size_t len, void **old)
 	bool try_compress = false;
 	if (h->size == 0)
 	{
+		debugf("Key deleted in vertex without children. Cleanup needed.\n");
 		radix_vertex *child = NULL;
+
 		while (h != t->head)
 		{
+			child = h;
+			debugf("Freeing child %p [%.*s] key:%d\n", (void*)child, (int)child->size, (char*)child->data, child->is_key);
 			free(child);
 			--t->num_vertices;
 			h = _stack_pop(&stack);
@@ -785,7 +825,9 @@ radix_del(radix_tree *t, uint8_t *s, size_t len, void **old)
 		}
 		if (child)
 		{
-			radix_vertex *new = _radix_remove_child(h, child);
+			debugf("Unlinking child %p from parent %p\n", (void*)child, (void*)h);
+
+			radix_vertex *new = _radix_del_child(h, child);
 			if (new != h)
 			{
 				radix_vertex *parent = _stack_peek(&stack);
@@ -820,12 +862,17 @@ radix_del(radix_tree *t, uint8_t *s, size_t len, void **old)
 
 	if (try_compress)
 	{
+		debugf("After removing %.*s:\n", (int)len, s);
+		debug_vertex("Compression may be needed",h);
+		debugf("Seek start node\n");
+
 		radix_vertex *parent;
 		while (1)
 		{
 			parent = _stack_pop(&stack);
 			if (!parent || parent->is_key || (!parent->is_compressed && parent->size != 1)) break;
 			h = parent;
+			debug_vertex("Going up to",h);
 		}
 
 		radix_vertex *start = h;
@@ -856,6 +903,7 @@ radix_del(radix_tree *t, uint8_t *s, size_t len, void **old)
 			new->is_null = false;
 			new->is_key = false;
 			new->is_compressed = true;
+			new->size = compression_size;
 			++t->num_vertices;
 
 			compression_size = 0;
@@ -864,19 +912,19 @@ radix_del(radix_tree *t, uint8_t *s, size_t len, void **old)
 			{
 				memcpy(new->data + compression_size, h->data, h->size);
 				compression_size += h->size;
-
 				radix_vertex **cp = radix_vertex_last_child_ptr(h);
-				memcpy(&h, cp, sizeof(h));
-				if (h->is_key || (!h->is_compressed && h->size != 1)) break;
-
 				radix_vertex *to_free = h;
+				memcpy(&h, cp, sizeof(h));
 				free(to_free);
 				--t->num_vertices;
-			}
+				if (h->is_key || (!h->is_compressed && h->size != 1)) break;
 
-			// fix parent link
+			}
+			debug_vertex("New vertex", new);
+
+			// fix parent link, h should point to first vertex
 			radix_vertex **cp = radix_vertex_last_child_ptr(new);
-			memcpy(&h, cp, sizeof(h));
+			memcpy(cp, &h, sizeof(h));
 
 			if (parent)
 			{
@@ -887,6 +935,8 @@ radix_del(radix_tree *t, uint8_t *s, size_t len, void **old)
 			{
 				t->head = new;
 			}
+
+			debugf("Compressed %d vertices, %d total bytes\n", vertices, (int)compression_size);
 		}
 	}
 
@@ -912,3 +962,56 @@ radix_find(radix_tree *t, uint8_t *s, size_t len)
 	return radix_get_data(h);
 }
 
+void 
+radix_tostring(radix_tree *t)
+{
+	(void)t;	
+}
+
+void
+_radix_print(radix_vertex *v, int level, int left_pad)
+{
+	char s = v->is_compressed ? '"' : '[';
+	char e = v->is_compressed ? '"' : ']';
+
+	int num_chars = printf("%c%.*s%c", s, v->size, v->data, e);
+	if (v->is_key)
+		num_chars += printf("=%p", radix_get_data(v));
+	 
+	int num_children = v->is_compressed ? 1 : v->size;
+
+	if (level)
+	{
+		/* " `-(x) " has len 7 and " -> " has len 4 */
+		left_pad += (num_children > 1) ? 7 : 4;
+		if (num_children == 1) left_pad += num_chars;
+	}
+
+	radix_vertex **cp = radix_vertex_first_child_ptr(v);
+	char *subtree = " `-(%c) ";
+	for (int i = 0; i < num_children; ++i)
+	{
+		if (num_children > 1)
+		{
+			printf("\n");
+			for (int j = 0; j < left_pad; ++j) putchar(' ');
+			printf(subtree, v->data[i]);
+		}
+		else
+		{
+			printf(" -> ");
+		}
+
+		radix_vertex *child;
+		memcpy(&child, cp, sizeof(child));
+		_radix_print(child, level + 1, left_pad);
+		++cp;
+	}
+}
+
+void 
+radix_print(radix_tree *t)
+{
+	_radix_print(t->head, 0, 0);	
+	putchar('\n');
+}
