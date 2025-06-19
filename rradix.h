@@ -43,8 +43,6 @@ void radix_free(radix_tree *t);
 int radix_insert(radix_tree *t, uint8_t *s, size_t len, void *data, void **old);
 int radix_del(radix_tree *t, uint8_t *s, size_t len, void **old);
 void *radix_find(radix_tree *t, uint8_t *s, size_t len);
-
-void radix_tostring(radix_tree *t); // for debugging
 void radix_print(radix_tree *t);
 
 #endif // !__RRADIX_H__

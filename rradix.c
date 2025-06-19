@@ -962,12 +962,6 @@ radix_find(radix_tree *t, uint8_t *s, size_t len)
 	return radix_get_data(h);
 }
 
-void 
-radix_tostring(radix_tree *t)
-{
-	(void)t;	
-}
-
 void
 _radix_print(radix_vertex *v, int level, int left_pad)
 {
