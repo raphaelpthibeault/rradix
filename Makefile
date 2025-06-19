@@ -1,15 +1,14 @@
 CC = gcc
-CFLAGS = -std=c2x -O2 -Wall -Wextra -pedantic -I./ # -lcmocka
+CFLAGS = -std=c2x -O2 -Wall -Wextra -pedantic -I./ -lcmocka
 
 all: clean rradix-test
 
 test: clean rradix-test
 	@echo "----- Running standard tests... -----"
-	@./rds-test
+	@./rradix-test
 
 rradix-test: rradix.c rradix.h tests.c
 	$(CC) -o $@ $^ $(CFLAGS)
-
 
 clean:
 	rm -f rradix-test

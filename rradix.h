@@ -41,7 +41,6 @@ radix_tree *radix_new(void);
 void radix_free_callback(radix_tree *t, void (*free_callback)(void *)); // free a tree but with a callback to free auxiliary data
 void radix_free(radix_tree *t);
 int radix_insert(radix_tree *t, uint8_t *s, size_t len, void *data, void **old);
-
 int radix_del(radix_tree *t, uint8_t *s, size_t len, void **old);
 void *radix_find(radix_tree *t, uint8_t *s, size_t len);
 
